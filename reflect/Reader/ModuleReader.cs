@@ -52,6 +52,13 @@ namespace IKVM.Reflection.Reader
 		}
 	}
 
+	// FIXME: Put this somewhere else
+	class PdbStream {
+		public int EntryPoint { get; set; }
+		public ulong ReferencedTables { get; set; }
+		public int[] TableSizes { get; set; }
+	}
+
 	sealed class ModuleReader : Module
 	{
 		private readonly Stream stream;
@@ -78,6 +85,7 @@ namespace IKVM.Reflection.Reader
 		private Dictionary<int, string> strings = new Dictionary<int, string>();
 		private Dictionary<TypeName, Type> types = new Dictionary<TypeName, Type>();
 		private Dictionary<TypeName, LazyForwardedType> forwardedTypes = new Dictionary<TypeName, LazyForwardedType>();
+		private bool isMetadataOnly;
 
 		private sealed class LazyForwardedType
 		{
@@ -91,16 +99,31 @@ namespace IKVM.Reflection.Reader
 
 			internal Type GetType(ModuleReader module)
 			{
-				return type ?? (type = module.ResolveExportedType(index));
+				// guard against circular type forwarding
+				if (type == MarkerType.Pinned)
+				{
+					TypeName typeName = module.GetTypeName(module.ExportedType.records[index].TypeNamespace, module.ExportedType.records[index].TypeName);
+					return module.universe.GetMissingTypeOrThrow(module, module, null, typeName).SetCyclicTypeForwarder();
+				}
+				else if (type == null)
+				{
+					type = MarkerType.Pinned;
+					type = module.ResolveExportedType(index);
+				}
+				return type;
 			}
 		}
 
-		internal ModuleReader(AssemblyReader assembly, Universe universe, Stream stream, string location)
+		internal ModuleReader(AssemblyReader assembly, Universe universe, Stream stream, string location, bool mapped)
 			: base(universe)
 		{
 			this.stream = universe != null && universe.MetadataOnly ? null : stream;
 			this.location = location;
-			Read(stream);
+			Read(stream, mapped);
+			if (universe != null && universe.WindowsRuntimeProjection && imageRuntimeVersion.StartsWith("WindowsRuntime ", StringComparison.Ordinal))
+			{
+				WindowsRuntimeProjection.Patch(this, strings, ref imageRuntimeVersion, ref blobHeap);
+			}
 			if (assembly == null && AssemblyTable.records.Length != 0)
 			{
 				assembly = new AssemblyReader(location, this);
@@ -108,13 +131,26 @@ namespace IKVM.Reflection.Reader
 			this.assembly = assembly;
 		}
 
-		private void Read(Stream stream)
+		private void Read(Stream stream, bool mapped)
 		{
 			BinaryReader br = new BinaryReader(stream);
-			peFile.Read(br);
-			stream.Seek(peFile.RvaToFileOffset(peFile.GetComDescriptorVirtualAddress()), SeekOrigin.Begin);
-			cliHeader.Read(br);
-			stream.Seek(peFile.RvaToFileOffset(cliHeader.MetaData.VirtualAddress), SeekOrigin.Begin);
+
+			long pos = stream.Position;
+			uint header = br.ReadUInt32();
+			stream.Seek(pos, SeekOrigin.Begin);
+
+			if (header == 0x424a5342)
+			{
+				// Naked metadata file (enc/portable pdb)
+				this.isMetadataOnly = true;
+			}
+			else
+			{
+				peFile.Read(br, mapped);
+				stream.Seek(peFile.RvaToFileOffset(peFile.GetComDescriptorVirtualAddress()), SeekOrigin.Begin);
+				cliHeader.Read(br);
+				stream.Seek(peFile.RvaToFileOffset(cliHeader.MetaData.VirtualAddress), SeekOrigin.Begin);
+			}
 			foreach (StreamHeader sh in ReadStreamHeaders(br, out imageRuntimeVersion))
 			{
 				switch (sh.Name)
@@ -134,9 +170,26 @@ namespace IKVM.Reflection.Reader
 						break;
 					case "#~":
 					case "#-":
-						stream.Seek(peFile.RvaToFileOffset(cliHeader.MetaData.VirtualAddress + sh.Offset), SeekOrigin.Begin);
+						if (isMetadataOnly)
+						{
+							stream.Seek(sh.Offset, SeekOrigin.Begin);
+						}
+						else
+						{
+							stream.Seek(peFile.RvaToFileOffset(cliHeader.MetaData.VirtualAddress + sh.Offset), SeekOrigin.Begin);
+						}
 						ReadTables(br);
 						break;
+				case "#Pdb":
+					var entryPoint = br.ReadInt32 ();
+					var referencedTables = br.ReadUInt64 ();
+					var tableSizes = new int [64];
+					for (int i = 0; i < 64; ++i) {
+						if ((referencedTables & ((ulong)1 << i)) != 0)
+							tableSizes [i] = (int)br.ReadUInt32 ();
+					}
+					/*pdbStream =*/ new PdbStream () { EntryPoint = entryPoint, ReferencedTables = referencedTables, TableSizes = tableSizes };
+					break;
 					default:
 						// we ignore unknown streams, because the CLR does so too
 						// (and some obfuscators add bogus streams)
@@ -189,6 +242,10 @@ namespace IKVM.Reflection.Reader
 			{
 				if ((Valid & (1UL << i)) != 0)
 				{
+					if (tables[i] == null)
+					{
+						throw new NotImplementedException ("Unknown table " + i);
+					}
 					tables[i].Sorted = (Sorted & (1UL << i)) != 0;
 					tables[i].RowCount = br.ReadInt32();
 				}
@@ -210,7 +267,14 @@ namespace IKVM.Reflection.Reader
 		private byte[] ReadHeap(Stream stream, uint offset, uint size)
 		{
 			byte[] buf = new byte[size];
-			stream.Seek(peFile.RvaToFileOffset(cliHeader.MetaData.VirtualAddress + offset), SeekOrigin.Begin);
+			if (isMetadataOnly)
+			{
+				stream.Seek(offset, SeekOrigin.Begin);
+			}
+			else
+			{
+				stream.Seek(peFile.RvaToFileOffset(cliHeader.MetaData.VirtualAddress + offset), SeekOrigin.Begin);
+			}
 			for (int pos = 0; pos < buf.Length; )
 			{
 				int read = stream.Read(buf, pos, buf.Length - pos);
@@ -264,7 +328,7 @@ namespace IKVM.Reflection.Reader
 					}
 					else if (!type.IsNestedByFlags)
 					{
-						types.Add(new TypeName(type.__Namespace, type.__Name), type);
+						types.Add(type.TypeName, type);
 					}
 				}
 				// add forwarded types to forwardedTypes dictionary (because Module.GetType(string) should return them)
@@ -334,6 +398,13 @@ namespace IKVM.Reflection.Reader
 			return ByteReader.FromBlob(blobHeap, blobIndex);
 		}
 
+		internal override Guid GetGuid(int guidIndex)
+		{
+			byte[] buf = new byte[16];
+			Buffer.BlockCopy(guidHeap, 16 * (guidIndex - 1), buf, 0, 16);
+			return new Guid(buf);
+		}
+
 		public override string ResolveString(int metadataToken)
 		{
 			string str;
@@ -387,14 +458,14 @@ namespace IKVM.Reflection.Reader
 						case AssemblyRefTable.Index:
 							{
 								Assembly assembly = ResolveAssemblyRef((scope & 0xFFFFFF) - 1);
-								TypeName typeName = GetTypeName(TypeRef.records[index].TypeNameSpace, TypeRef.records[index].TypeName);
+								TypeName typeName = GetTypeName(TypeRef.records[index].TypeNamespace, TypeRef.records[index].TypeName);
 								typeRefs[index] = assembly.ResolveType(this, typeName);
 								break;
 							}
 						case TypeRefTable.Index:
 							{
 								Type outer = ResolveType(scope, null);
-								TypeName typeName = GetTypeName(TypeRef.records[index].TypeNameSpace, TypeRef.records[index].TypeName);
+								TypeName typeName = GetTypeName(TypeRef.records[index].TypeNamespace, TypeRef.records[index].TypeName);
 								typeRefs[index] = outer.ResolveNestedType(this, typeName);
 								break;
 							}
@@ -417,7 +488,7 @@ namespace IKVM.Reflection.Reader
 								{
 									module = ResolveModuleRef(ModuleRef.records[(scope & 0xFFFFFF) - 1]);
 								}
-								TypeName typeName = GetTypeName(TypeRef.records[index].TypeNameSpace, TypeRef.records[index].TypeName);
+								TypeName typeName = GetTypeName(TypeRef.records[index].TypeNamespace, TypeRef.records[index].TypeName);
 								typeRefs[index] = module.FindType(typeName) ?? module.universe.GetMissingTypeOrThrow(this, module, null, typeName);
 								break;
 							}
@@ -511,35 +582,16 @@ namespace IKVM.Reflection.Reader
 		private Assembly ResolveAssemblyRefImpl(ref AssemblyRefTable.Record rec)
 		{
 			const int PublicKey = 0x0001;
-			string name = String.Format("{0}, Version={1}.{2}.{3}.{4}, Culture={5}, {6}={7}",
+			string name = AssemblyName.GetFullName(
 				GetString(rec.Name),
 				rec.MajorVersion,
 				rec.MinorVersion,
 				rec.BuildNumber,
 				rec.RevisionNumber,
 				rec.Culture == 0 ? "neutral" : GetString(rec.Culture),
-				(rec.Flags & PublicKey) == 0 ? "PublicKeyToken" : "PublicKey",
-				PublicKeyOrTokenToString(rec.PublicKeyOrToken));
+				rec.PublicKeyOrToken == 0 ? Empty<byte>.Array : (rec.Flags & PublicKey) == 0 ? GetBlobCopy(rec.PublicKeyOrToken) : AssemblyName.ComputePublicKeyToken(GetBlobCopy(rec.PublicKeyOrToken)),
+				rec.Flags);
 			return universe.Load(name, this, true);
-		}
-
-		private string PublicKeyOrTokenToString(int publicKeyOrToken)
-		{
-			if (publicKeyOrToken == 0)
-			{
-				return "null";
-			}
-			ByteReader br = GetBlob(publicKeyOrToken);
-			if (br.Length == 0)
-			{
-				return "null";
-			}
-			StringBuilder sb = new StringBuilder(br.Length * 2);
-			while (br.Length > 0)
-			{
-				sb.AppendFormat("{0:x2}", br.ReadByte());
-			}
-			return sb.ToString();
 		}
 
 		public override Guid ModuleVersionId
@@ -587,7 +639,7 @@ namespace IKVM.Reflection.Reader
 			PopulateTypeDef();
 			foreach (Type type in types.Values)
 			{
-				if (new TypeName(type.__Namespace, type.__Name).ToLowerInvariant() == lowerCaseName)
+				if (type.TypeName.ToLowerInvariant() == lowerCaseName)
 				{
 					return type;
 				}
@@ -879,7 +931,11 @@ namespace IKVM.Reflection.Reader
 				{
 					return field;
 				}
+#if CORECLR
+				throw new MissingFieldException(org.ToString() + "." + name);
+#else
 				throw new MissingFieldException(org.ToString(), name);
+#endif
 			}
 			else
 			{
@@ -898,7 +954,11 @@ namespace IKVM.Reflection.Reader
 				{
 					return method;
 				}
+#if CORECLR
+				throw new MissingMethodException(org.ToString() + "." + name);
+#else
 				throw new MissingMethodException(org.ToString(), name);
+#endif
 			}
 		}
 
@@ -1145,8 +1205,17 @@ namespace IKVM.Reflection.Reader
 			get { return metadataStreamVersion; }
 		}
 
+		public override bool __IsMetadataOnly
+		{
+			get { return isMetadataOnly; }
+		}
+
 		public override void __GetDataDirectoryEntry(int index, out int rva, out int length)
 		{
+			if (isMetadataOnly)
+			{
+				throw new NotSupportedException();
+			}
 			peFile.GetDataDirectoryEntry(index, out rva, out length);
 		}
 
@@ -1237,7 +1306,7 @@ namespace IKVM.Reflection.Reader
 				if ((CustomAttribute.records[i].Parent >> 24) == TypeRefTable.Index)
 				{
 					int index = (CustomAttribute.records[i].Parent & 0xFFFFFF) - 1;
-					if (typeName == GetTypeName(TypeRef.records[index].TypeNameSpace, TypeRef.records[index].TypeName))
+					if (typeName == GetTypeName(TypeRef.records[index].TypeNamespace, TypeRef.records[index].TypeName))
 					{
 						list.Add(new CustomAttributeData(this, i));
 					}
